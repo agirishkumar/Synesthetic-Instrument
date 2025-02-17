@@ -12,7 +12,7 @@
 MidiParser::MidiParser(const std::string& device_name) 
     : midi_stream(nullptr), device_found(false), smf(nullptr), 
       current_event(nullptr), current_time(0.0), tempo(500000.0), 
-      particle_index(0) {
+      particle_index(0), audio_analyzer(new AudioAnalyzer(2048)) {
     
     if (!device_name.empty()) {
         initialize_midi();
@@ -44,6 +44,7 @@ MidiParser::MidiParser(const std::string& device_name)
 
 MidiParser::~MidiParser() {
     cleanup_midi();
+    delete audio_analyzer;
 }
 
 void MidiParser::initialize_midi() {
@@ -91,13 +92,28 @@ void MidiParser::process_events(Particle* particles, int max_particles) {
     float delta_time = std::chrono::duration<float>(now - last_time).count();
     last_time = now;
 
-    // Update all particles
+    // Create and update audio parameters
+    AudioParams audio_params;
+    audio_analyzer->analyze();
+    audio_params.bass_magnitude = audio_analyzer->get_bass_magnitude();
+    audio_params.mid_magnitude = audio_analyzer->get_mid_magnitude();
+    audio_params.treble_magnitude = audio_analyzer->get_treble_magnitude();
+    audio_params.global_intensity = (audio_params.bass_magnitude + 
+                                   audio_params.mid_magnitude + 
+                                   audio_params.treble_magnitude) / 3.0f;
+
+    // Allocate device memory for audio parameters
+    AudioParams* d_audio_params;
+    cudaMalloc(&d_audio_params, sizeof(AudioParams));
+    cudaMemcpy(d_audio_params, &audio_params, sizeof(AudioParams), cudaMemcpyHostToDevice);
+
+    // Update particles with audio parameters
     int threadsPerBlock = 256;
     int numBlocks = (max_particles + threadsPerBlock - 1) / threadsPerBlock;
-    update_particles<<<numBlocks, threadsPerBlock>>>(particles, max_particles, delta_time);
+    update_particles<<<numBlocks, threadsPerBlock>>>(particles, max_particles, delta_time, d_audio_params);
     cudaDeviceSynchronize();
     
-    // Process new MIDI events
+    // Process MIDI events
     PmEvent buffer[MIDI_BUFFER_SIZE];
     int count = Pm_Read(midi_stream, buffer, MIDI_BUFFER_SIZE);
     
@@ -111,6 +127,9 @@ void MidiParser::process_events(Particle* particles, int max_particles) {
                 float velocity = Pm_MessageData2(msg) / 127.0f;
                 
                 if(velocity > 0.0f) {
+                    // Process note for audio analysis
+                    audio_analyzer->process_midi_note(note, velocity, PARTICLE_LIFETIME);
+                    
                     int particles_per_note = 128;
                     int start_idx = (particle_index % (max_particles / particles_per_note)) * particles_per_note;
                     
@@ -118,7 +137,8 @@ void MidiParser::process_events(Particle* particles, int max_particles) {
                         dim3 noteBlocks(4);
                         dim3 noteThreads(32);
                         handle_note_event<<<noteBlocks, noteThreads>>>(
-                            particles, note, velocity, start_idx, particles_per_note, channel
+                            particles, note, velocity, start_idx, particles_per_note, 
+                            channel, d_audio_params
                         );
                         cudaDeviceSynchronize();
                         
@@ -128,7 +148,11 @@ void MidiParser::process_events(Particle* particles, int max_particles) {
             }
         }
     }
+
+    // Clean up
+    cudaFree(d_audio_params);
 }
+
 
 bool MidiParser::load_midi_file(const std::string& filename) {
     if (smf != nullptr) {
@@ -162,40 +186,48 @@ void MidiParser::process_midi_file_events(Particle* particles, int max_particles
     auto now = std::chrono::high_resolution_clock::now();
     float delta_time = std::chrono::duration<float>(now - last_time).count();
     last_time = now;
-    
-    // Update existing particles
+
+    // Create and update audio parameters
+    AudioParams audio_params;
+    audio_analyzer->analyze();
+    audio_params.bass_magnitude = audio_analyzer->get_bass_magnitude();
+    audio_params.mid_magnitude = audio_analyzer->get_mid_magnitude();
+    audio_params.treble_magnitude = audio_analyzer->get_treble_magnitude();
+    audio_params.global_intensity = (audio_params.bass_magnitude + 
+                                   audio_params.mid_magnitude + 
+                                   audio_params.treble_magnitude) / 3.0f;
+
+    // Allocate device memory for audio parameters
+    AudioParams* d_audio_params;
+    cudaMalloc(&d_audio_params, sizeof(AudioParams));
+    cudaMemcpy(d_audio_params, &audio_params, sizeof(AudioParams), cudaMemcpyHostToDevice);
+
+    // Update particles
     int threadsPerBlock = 256;
     int numBlocks = (max_particles + threadsPerBlock - 1) / threadsPerBlock;
-    update_particles<<<numBlocks, threadsPerBlock>>>(particles, max_particles, delta_time);
+    update_particles<<<numBlocks, threadsPerBlock>>>(particles, max_particles, delta_time, d_audio_params);
     cudaDeviceSynchronize();
     
-    // Calculate current playback time
+    // Process MIDI file events
     auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
     current_time = std::chrono::duration<double>(elapsed).count();
     
     while ((current_event = smf_get_next_event(smf)) != nullptr) {
-        // Convert ticks to seconds
         double seconds = (current_event->time_pulses * (tempo / 1000000.0)) / smf->ppqn;
         
         if (seconds > current_time) {
             break;
         }
         
-        // Handle tempo changes
-        if (current_event->midi_buffer[0] == 0xFF && 
-            current_event->midi_buffer[1] == 0x51 && 
-            current_event->midi_buffer[2] == 0x03) {
-            tempo = (current_event->midi_buffer[3] << 16) |
-                   (current_event->midi_buffer[4] << 8) |
-                    current_event->midi_buffer[5];
-        }
-        // Handle note events
-        else if ((current_event->midi_buffer[0] & 0xF0) == 0x90) {
+        if ((current_event->midi_buffer[0] & 0xF0) == 0x90) {
             uint8_t channel = current_event->midi_buffer[0] & 0x0F;
             uint8_t note = current_event->midi_buffer[1];
             float velocity = current_event->midi_buffer[2] / 127.0f;
             
             if (velocity > 0.0f) {
+                // Process note for audio analysis
+                audio_analyzer->process_midi_note(note, velocity, PARTICLE_LIFETIME);
+                
                 int particles_per_note = 128;
                 int start_idx = (particle_index % (max_particles / particles_per_note)) * particles_per_note;
                 
@@ -203,7 +235,8 @@ void MidiParser::process_midi_file_events(Particle* particles, int max_particles
                     dim3 noteBlocks(4);
                     dim3 noteThreads(32);
                     handle_note_event<<<noteBlocks, noteThreads>>>(
-                        particles, note, velocity, start_idx, particles_per_note, channel
+                        particles, note, velocity, start_idx, particles_per_note, 
+                        channel, d_audio_params
                     );
                     cudaDeviceSynchronize();
                     
@@ -212,8 +245,10 @@ void MidiParser::process_midi_file_events(Particle* particles, int max_particles
             }
         }
     }
+
+    // Clean up
+    cudaFree(d_audio_params);
     
-    // Loop back to start if we've reached the end
     if (smf_get_next_event(smf) == nullptr) {
         reset();
     }

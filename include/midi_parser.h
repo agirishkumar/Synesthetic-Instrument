@@ -23,34 +23,38 @@ extern "C" {
 #endif
 
 #include "particle.h"
+#include "audio_analyzer.h"
+#include <string>
+#include <chrono>
 
 class MidiParser {
-public:
-    MidiParser(const std::string& device_name = "");
-    ~MidiParser();
+    public:
+        MidiParser(const std::string& device_name = "");
+        ~MidiParser();
+        
+        void process_events(Particle* particles, int max_particles);
+        bool load_midi_file(const std::string& filename);
+        void process_midi_file_events(Particle* particles, int max_particles);
+        void reset();
+        
+        static void list_devices();
+        bool is_device_found() const { return device_found; }
     
-    void process_events(Particle* particles, int max_particles);
-    bool load_midi_file(const std::string& filename);
-    void process_midi_file_events(Particle* particles, int max_particles);
-    void reset();
+    private:
+        PortMidiStream* midi_stream;
+        bool device_found;
+        smf_t* smf;
+        smf_event_t* current_event;
+        
+        std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
+        double current_time;
+        double tempo;
+        
+        int particle_index;
+        AudioAnalyzer* audio_analyzer;
+        
+        void initialize_midi();
+        void cleanup_midi();
+    };
     
-    static void list_devices();
-    bool is_device_found() const { return device_found; }
-
-private:
-    PortMidiStream* midi_stream;
-    bool device_found;
-    smf_t* smf;
-    smf_event_t* current_event;
-    
-    std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
-    double current_time;
-    double tempo;
-    
-    int particle_index;
-    
-    void initialize_midi();
-    void cleanup_midi();
-};
-
-#endif
+    #endif

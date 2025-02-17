@@ -25,7 +25,7 @@ CFLAGS = -arch=sm_86 \
          -D_GNU_SOURCE
 
 # GLM is header-only, so we remove it from LIBS
-LIBS = -lportmidi -lporttime -lsmf -lGL -lGLEW -lglfw -lcudart $(GLIB_LIBS)
+LIBS = -lportmidi -lporttime -lsmf -lGL -lGLEW -lglfw -lcudart -lcufft $(GLIB_LIBS)
 
 SRC_DIR = src
 KERNEL_DIR = kernels
@@ -35,6 +35,7 @@ BUILD_DIR = build
 # Source files
 SOURCES = $(SRC_DIR)/main.cu \
           $(SRC_DIR)/midi_processor.cu \
+          $(SRC_DIR)/audio_analyzer.cu \
           $(KERNEL_DIR)/particle_kernels.cu
 
 # Object files

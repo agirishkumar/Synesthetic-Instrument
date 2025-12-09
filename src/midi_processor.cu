@@ -12,7 +12,7 @@
 MidiParser::MidiParser(const std::string& device_name) 
     : midi_stream(nullptr), device_found(false), smf(nullptr), 
       current_event(nullptr), current_time(0.0), tempo(500000.0), 
-      particle_index(0), audio_analyzer(new AudioAnalyzer(2048)) {
+      last_processed_pulses(-1), particle_index(0), audio_analyzer(new AudioAnalyzer(2048)) {
     
     if (!device_name.empty()) {
         initialize_midi();
@@ -165,6 +165,25 @@ bool MidiParser::load_midi_file(const std::string& filename) {
         return false;
     }
     
+    // Find initial tempo from the file (look at first few events)
+    smf_event_t* event;
+    tempo = 500000.0; // default tempo
+    int events_checked = 0;
+    while ((event = smf_get_next_event(smf)) != nullptr && events_checked < 100) {
+        events_checked++;
+        // Check for tempo change events (Meta Event 0xFF 0x51)
+        if (event->midi_buffer_length >= 3 && 
+            event->midi_buffer[0] == 0xFF && 
+            event->midi_buffer[1] == 0x51) {
+            if (event->midi_buffer_length >= 6) {
+                tempo = (event->midi_buffer[3] << 16) | 
+                        (event->midi_buffer[4] << 8) | 
+                        event->midi_buffer[5];
+                break; // Found first tempo, use it as initial
+            }
+        }
+    }
+    
     reset();
     return true;
 }
@@ -173,6 +192,7 @@ void MidiParser::reset() {
     if (smf) {
         current_event = nullptr;
         current_time = 0.0;
+        last_processed_pulses = -1;
         particle_index = 0;
         smf_rewind(smf);
         start_time = std::chrono::high_resolution_clock::now();
@@ -212,11 +232,42 @@ void MidiParser::process_midi_file_events(Particle* particles, int max_particles
     auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
     current_time = std::chrono::duration<double>(elapsed).count();
     
+    bool reached_end = false;
+    long max_processed_pulses = last_processed_pulses;
+    
+    // Process all events that are due now
+    // Use a lookahead window to avoid skipping events due to timing precision
     while ((current_event = smf_get_next_event(smf)) != nullptr) {
+        // Only process events we haven't processed yet (avoid duplicates on rewind)
+        if (last_processed_pulses >= 0 && current_event->time_pulses <= last_processed_pulses) {
+            continue;
+        }
+        
+        // Calculate time for this event
         double seconds = (current_event->time_pulses * (tempo / 1000000.0)) / smf->ppqn;
         
-        if (seconds > current_time) {
+        // If this event is significantly in the future (> 0.2s), break and process it next frame
+        // This prevents skipping events while also not processing too far ahead
+        if (seconds > current_time + 0.2) {
             break;
+        }
+        
+        // Track the maximum time_pulses we've seen in this frame
+        if (current_event->time_pulses > max_processed_pulses) {
+            max_processed_pulses = current_event->time_pulses;
+        }
+        
+        // Handle tempo change events (Meta Event 0xFF 0x51) - process these immediately
+        if (current_event->midi_buffer_length >= 3 && 
+            current_event->midi_buffer[0] == 0xFF && 
+            current_event->midi_buffer[1] == 0x51) {
+            // Tempo change: bytes are in microseconds per quarter note (24-bit)
+            if (current_event->midi_buffer_length >= 6) {
+                tempo = (current_event->midi_buffer[3] << 16) | 
+                        (current_event->midi_buffer[4] << 8) | 
+                        current_event->midi_buffer[5];
+            }
+            continue;
         }
         
         if ((current_event->midi_buffer[0] & 0xF0) == 0x90) {
@@ -245,11 +296,23 @@ void MidiParser::process_midi_file_events(Particle* particles, int max_particles
             }
         }
     }
+    
+    // Update last processed position to the maximum we've seen this frame
+    // This ensures we process all events at the same time_pulses value in one frame
+    if (max_processed_pulses > last_processed_pulses) {
+        last_processed_pulses = max_processed_pulses;
+    }
+    
+    // Check if we've reached the end of the file
+    if (current_event == nullptr) {
+        reached_end = true;
+    }
 
     // Clean up
     cudaFree(d_audio_params);
     
-    if (smf_get_next_event(smf) == nullptr) {
+    // Reset and loop if we've reached the end
+    if (reached_end) {
         reset();
     }
 }

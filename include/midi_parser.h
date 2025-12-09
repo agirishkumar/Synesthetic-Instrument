@@ -49,6 +49,7 @@ class MidiParser {
         std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
         double current_time;
         double tempo;
+        long last_processed_pulses;  // Track last processed event position
         
         int particle_index;
         AudioAnalyzer* audio_analyzer;
